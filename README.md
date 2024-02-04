@@ -41,6 +41,8 @@ The following table shows the speedup on M2-Ultra compared to llama.cpp for llam
 
 We currently supports mainstream int4 quantization (e.g., GGUF, GPTQ) on ARM CPU (e.g., M1/M2 Mac, Snapdragon CPUs).
 
+Install the project from source with `pip install -e .`.
+
 ### Requirements
 
 This project used TVM for kernel code-generation and auto-tuning.
