@@ -6,21 +6,74 @@ from t_mac.ops import QGeMMLUTBitsCodegen, QGeMMLUTBitsPreprocessorCodegen
 from t_mac.weights import preprocess_weights
 from t_mac.utils import get_default_device_kwargs, nmse
 import logging
+from typing import Optional, Tuple
+
+
+def hvx_preprocess_weights(
+    w: np.ndarray,
+    scales: np.ndarray,
+    zeros: Optional[np.ndarray] = None,
+    bits: int = 4,
+    g: int = 4,
+    tile_p: int = 512,
+    tile_q: int = 64,
+    vec_p: int = 128,
+    vec_q: int = 4,
+    vec_c: int = 32,
+) -> Tuple[np.ndarray, np.ndarray]:
+
+    assert(w.dtype == "uint8")
+
+    M, K = w.shape
+
+    P = M * bits
+    Q = K // g
+
+    # (M, K, bits)
+    w = np.stack([(w >> ib) & 1 for ib in range(bits)], axis=-1)
+    # (M, K, bits) -> (M, bits, K) -> (M, bits, K) -> (M, bits, K // g, g)
+    w = w.transpose(0, 2, 1).reshape(M, bits, Q, g)
+    w = sum([(w[:, :, :, ig] << ig) for ig in range(g)])
+    # (P // vec_c, vec_c, Q)
+    w = w.reshape(M // vec_c, vec_c, bits, Q).transpose(0, 2, 1, 3)
+    w = w.reshape(P // tile_p, tile_p, Q // tile_q, tile_q).transpose(0, 2, 1, 3)
+    #             0            1            2                3      4                5
+    w = w.reshape(P // tile_p, Q // tile_q, tile_p // vec_p, vec_p, tile_q // vec_q, vec_q).transpose(0, 1, 2, 4, 5, 3)
+    # Pack and interleave: q = 0 -> lo_bo, q = 1 -> lo_to, q = 2 -> hi_bo, q = 3 -> hi_to
+    # lo -> low 128 bytes, hi -> high 128 bytes, bo -> bot 4 bit in a byte, to -> top 4 bit in a byte
+    w = w.reshape(-1, vec_q, vec_p).reshape(-1, vec_q // 2, 2, vec_p).transpose(0, 1, 3, 2)
+    w = sum([(w[:, :, :, n] << (n * g)) for n in range(2)])
+    w = w.reshape(P // tile_p, Q // tile_q, tile_p // vec_p, tile_q // vec_q, vec_q // 2, vec_p)
+
+    if scales.size >= M:
+        group_size = K // scales.shape[1]
+        scales = scales.reshape(P // tile_p, tile_p // bits, K // group_size).transpose(0, 2, 1)
+        scales = scales.reshape(P // tile_p, K // group_size, tile_p // bits // vec_c, vec_c)
+        if zeros is not None:
+            zeros = zeros.reshape(P // tile_p, tile_p // bits, K // group_size).transpose(0, 2, 1)
+            zeros = zeros.reshape(P // tile_p, K // group_size, tile_p // bits // vec_c, vec_c)
+            scales = np.stack([scales, zeros], axis=-2)
+        # input size of current TVM API
+        scales = scales.reshape(P // tile_p, K // group_size, -1)
+    else:
+        if zeros is not None:
+            scales = np.concatenate([scales, zeros])
+    return w, scales
 
 
 logging.basicConfig()
 logging.getLogger().setLevel(logging.INFO)
 
 bits = 2
-M = 4096 * bits
+M = 128 * bits
 N = 1
-K = 4096
-zero_point = True
+K = 256
+zero_point = False
 dtype = "int8"
 g = 4
 group_size = 128
-act_group_size = 64
-m_groups = -1  # should be -1 or 1 in test_e2e.py
+act_group_size = -1
+m_groups = 1  # should be -1 or 1 in test_e2e.py
 
 if act_group_size == -1:
     act_group_size = K
@@ -92,8 +145,14 @@ LUT_Scales = tvm.nd.array(np.zeros((N, K // act_group_size), dtype=out_dtype), d
 LUT_Biases = tvm.nd.array(np.zeros((N, K // act_group_size), dtype=out_dtype), dev)
 QLUT = tvm.nd.array(np.zeros((N, K // g, 1 << g), dtype=dtype), dev)
 
+B_t.numpy().tofile("x.bin")
+HVX_A, HVX_S = hvx_preprocess_weights(Aref, Sref, Zref, bits=bits, g=g, tile_p=M)
+HVX_A.tofile("w.bin")
+HVX_S.tofile("s.bin")
+
 pf(B_t, LUT_Scales, LUT_Biases, QLUT)
 qf(A_t, QLUT, Scales_t, LUT_Scales, LUT_Biases, C_t)
+C_t.numpy().tofile("y.bin")
 
 print(C_t.numpy())
 
