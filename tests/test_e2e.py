@@ -36,6 +36,9 @@ def hvx_preprocess_weights(
     w = sum([(w[:, :, :, ig] << ig) for ig in range(g)])
     # (P // vec_c, vec_c, Q)
     w = w.reshape(M // vec_c, vec_c, bits, Q).transpose(0, 2, 1, 3)
+    assert (M // vec_c) % 2 == 0, "M must be divisible by vec_c * 2"
+    # Place bits=0 in even bytes, bits=1 in odd bytes, bits=2 in even bytes, etc.
+    w = w.reshape(P // vec_c // 2, 2, vec_c, Q).transpose(0, 2, 1, 3)
     w = w.reshape(P // tile_p, tile_p, Q // tile_q, tile_q).transpose(0, 2, 1, 3)
     #             0            1            2                3      4                5
     w = w.reshape(P // tile_p, Q // tile_q, tile_p // vec_p, vec_p, tile_q // vec_q, vec_q).transpose(0, 1, 2, 4, 5, 3)
@@ -65,9 +68,9 @@ logging.basicConfig()
 logging.getLogger().setLevel(logging.INFO)
 
 bits = 2
-M = 128 * bits
+M = 4096 * bits
 N = 1
-K = 256
+K = 4096
 zero_point = False
 dtype = "int8"
 g = 4
@@ -108,6 +111,7 @@ weight_dtype = qgemm.weight_dtype
 
 # Inputs
 Aref = np.random.randint(0, 2 ** bits, size=(M // bits, K)).astype(weight_dtype)
+# Aref = np.full_like(Aref, 2)
 Zref = None
 if m_groups == -1:
     Sref = np.abs(np.random.randn(M // bits, K // group_size).astype(out_dtype))
@@ -116,6 +120,10 @@ if m_groups == -1:
 else:
     Sref = np.abs(np.random.randn(m_groups,).astype(out_dtype))
 Bref = np.random.randn(N, K).astype(out_dtype)
+
+Bref = np.fromfile("test_data/x.bin", dtype=Bref.dtype).reshape(Bref.shape)
+import pdb; pdb.set_trace()
+Sref = np.fromfile("test_data/s.bin", dtype=Sref.dtype).reshape(Sref.shape)
 
 # Outputs
 if m_groups == -1:
@@ -145,14 +153,17 @@ LUT_Scales = tvm.nd.array(np.zeros((N, K // act_group_size), dtype=out_dtype), d
 LUT_Biases = tvm.nd.array(np.zeros((N, K // act_group_size), dtype=out_dtype), dev)
 QLUT = tvm.nd.array(np.zeros((N, K // g, 1 << g), dtype=dtype), dev)
 
-B_t.numpy().tofile("x.bin")
+# B_t.numpy().tofile("test_data/x.bin")
 HVX_A, HVX_S = hvx_preprocess_weights(Aref, Sref, Zref, bits=bits, g=g, tile_p=M)
-HVX_A.tofile("w.bin")
-HVX_S.tofile("s.bin")
+# HVX_A.tofile("test_data/w.bin")
+# HVX_S.tofile("test_data/s.bin")
 
 pf(B_t, LUT_Scales, LUT_Biases, QLUT)
+print(LUT_Scales.numpy())
+print(LUT_Biases.numpy())
+print(QLUT.numpy())
 qf(A_t, QLUT, Scales_t, LUT_Scales, LUT_Biases, C_t)
-C_t.numpy().tofile("y.bin")
+# C_t.numpy().tofile("test_data0/y.bin")
 
 print(C_t.numpy())
 
