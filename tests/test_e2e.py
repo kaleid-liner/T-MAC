@@ -64,19 +64,86 @@ def hvx_preprocess_weights(
     return w, scales
 
 
+def hvx_preprocess_weights_gptq(
+    w: np.ndarray,
+    scales: np.ndarray,
+    zeros: Optional[np.ndarray] = None,
+    bits: int = 4,
+    g: int = 4,
+    tile_p: int = 512,
+    tile_q: int = 64,
+    vec_p: int = 128,
+    vec_q: int = 4,
+    vec_c: int = 32,
+) -> Tuple[np.ndarray, np.ndarray]:
+
+    assert(w.dtype == "uint8")
+    # 4 = sizeof(int32/float) / sizeof(uint8)
+    assert(vec_p // 4 == vec_c)
+
+    M, K = w.shape
+
+    P = M * bits
+    Q = K // g
+
+    # (M, K, bits)
+    w = np.stack([(w >> ib) & 1 for ib in range(bits)], axis=-1)
+    # (M, K, bits) -> (M, bits, K) -> (M, bits, K) -> (M, bits, K // g, g)
+    w = w.transpose(0, 2, 1).reshape(M, bits, Q, g)
+    # (M, bits, K // g, g) -> (M, bits, Q)
+    w = sum([(w[:, :, :, ig] << ig) for ig in range(g)])
+    # (M, bits, Q) -> (M // vec_p, vec_p, bits, Q) -> (M // vec_p, bits, vec_p, Q) -> (P // vec_p, vec_p, Q)
+    w = w.reshape(M // vec_p, vec_p, bits, Q).transpose(0, 2, 1, 3)
+    # Interleave even and odd vec_c of w_vec
+    # 0, 1 -> even bytes of w_vec -> c_vec_0, c_vec_2 -> c_bitsum_lo
+    # 2, 3 ->  odd bytes of w_vec -> c_vec_1, c_vec_3 -> c_bitsum_hi
+    # w_vec = w0/w2/w0/w2......w1/w3/w1/w3
+    # c_vec_0, c_vec_2 = w0/w0......w1/w1
+    # c_vec_1, c_vec_3 = w2/w2......w3/w3
+    w = w.reshape(P // vec_p, 2, 2, vec_c, Q).transpose(0, 2, 3, 1, 4)
+    w = w.reshape(P // tile_p, tile_p, Q // tile_q, tile_q).transpose(0, 2, 1, 3)
+    #             0            1            2                3      4                5
+    w = w.reshape(P // tile_p, Q // tile_q, tile_p // vec_p, vec_p, tile_q // vec_q, vec_q).transpose(0, 1, 2, 4, 5, 3)
+    # Pack and interleave: q = 0 -> w_vec_lo_bo, q = 1 -> w_vec_lo_to, q = 2 -> w_vec_hi_bo, q = 3 -> w_vec_hi_to
+    # lo -> low 128 bytes, hi -> high 128 bytes, bo -> bot 4 bit in a byte, to -> top 4 bit in a byte
+    w = w.reshape(-1, vec_q, vec_p).reshape(-1, vec_q // 2, 2, vec_p).transpose(0, 1, 3, 2)
+    w = sum([(w[:, :, :, n] << (n * g)) for n in range(2)])
+    w = w.reshape(P // tile_p, Q // tile_q, tile_p // vec_p, tile_q // vec_q, vec_q // 2, vec_p)
+
+    if scales.size >= M:
+        group_size = K // scales.shape[1]
+        q_group_size = group_size // g
+        scales = scales.reshape(P // tile_p, tile_p // bits, Q // tile_q, tile_q // q_group_size).transpose(0, 2, 1, 3)
+        #                       0            1            2                        3      4
+        scales = scales.reshape(P // tile_p, Q // tile_q, tile_p // bits // vec_p, vec_p, tile_q // q_group_size).transpose(0, 1, 2, 4, 3)
+        # s_vec = s0/s0......s1/s1......s2/s2......s3/s3
+        # s_vec_lo_lo, s_vec_lo_hi = s0/s0......s1/s1 -> c_vec_0, c_vec_2 -> c_bitsum_lo
+        # no need for interleaving
+        if zeros is not None:
+            zeros = zeros.reshape(P // tile_p, tile_p // bits, K // group_size).transpose(0, 2, 1)
+            zeros = zeros.reshape(P // tile_p, K // group_size, tile_p // bits // vec_c, vec_c)
+            scales = np.stack([scales, zeros], axis=-2)
+        # input size of current TVM API
+        scales = scales.reshape(P // tile_p, Q // q_group_size, -1)
+    else:
+        if zeros is not None:
+            scales = np.concatenate([scales, zeros])
+    return w, scales
+
+
 logging.basicConfig()
 logging.getLogger().setLevel(logging.INFO)
 
 bits = 2
-M = 4096 * bits
+M = 128 * bits
 N = 1
-K = 4096
+K = 256
 zero_point = False
 dtype = "int8"
 g = 4
 group_size = 128
-act_group_size = -1
-m_groups = 1  # should be -1 or 1 in test_e2e.py
+act_group_size = 64
+m_groups = -1  # should be -1 or 1 in test_e2e.py
 
 if act_group_size == -1:
     act_group_size = K
@@ -121,9 +188,8 @@ else:
     Sref = np.abs(np.random.randn(m_groups,).astype(out_dtype))
 Bref = np.random.randn(N, K).astype(out_dtype)
 
-Bref = np.fromfile("test_data/x.bin", dtype=Bref.dtype).reshape(Bref.shape)
-import pdb; pdb.set_trace()
-Sref = np.fromfile("test_data/s.bin", dtype=Sref.dtype).reshape(Sref.shape)
+# Bref = np.fromfile("test_data/x.bin", dtype=Bref.dtype).reshape(Bref.shape)
+# Sref = np.fromfile("test_data/s.bin", dtype=Sref.dtype).reshape(Sref.shape)
 
 # Outputs
 if m_groups == -1:
@@ -152,18 +218,21 @@ C_t = tvm.nd.array(Cref, dev)
 LUT_Scales = tvm.nd.array(np.zeros((N, K // act_group_size), dtype=out_dtype), dev)
 LUT_Biases = tvm.nd.array(np.zeros((N, K // act_group_size), dtype=out_dtype), dev)
 QLUT = tvm.nd.array(np.zeros((N, K // g, 1 << g), dtype=dtype), dev)
+QLUT.numpy().tofile("test_data_gptq/l.bin")
+LUT_Scales.numpy().tofile("test_data_gptq/ls.bin")
+LUT_Biases.numpy().tofile("test_data_gptq/lb.bin")
 
-# B_t.numpy().tofile("test_data/x.bin")
-HVX_A, HVX_S = hvx_preprocess_weights(Aref, Sref, Zref, bits=bits, g=g, tile_p=M)
-# HVX_A.tofile("test_data/w.bin")
-# HVX_S.tofile("test_data/s.bin")
+B_t.numpy().tofile("test_data_gptq/x.bin")
+HVX_A, HVX_S = hvx_preprocess_weights_gptq(Aref, Sref, Zref, bits=bits, g=g, tile_p=M)
+HVX_A.tofile("test_data_gptq/w.bin")
+HVX_S.tofile("test_data_gptq/s.bin")
 
 pf(B_t, LUT_Scales, LUT_Biases, QLUT)
 print(LUT_Scales.numpy())
 print(LUT_Biases.numpy())
 print(QLUT.numpy())
 qf(A_t, QLUT, Scales_t, LUT_Scales, LUT_Biases, C_t)
-# C_t.numpy().tofile("test_data0/y.bin")
+C_t.numpy().tofile("test_data_gptq/y.bin")
 
 print(C_t.numpy())
 
