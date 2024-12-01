@@ -120,8 +120,12 @@ def hvx_preprocess_weights_gptq(
         # s_vec_lo_lo, s_vec_lo_hi = s0/s0......s1/s1 -> c_vec_0, c_vec_2 -> c_bitsum_lo
         # no need for interleaving
         if zeros is not None:
-            zeros = zeros.reshape(P // tile_p, tile_p // bits, K // group_size).transpose(0, 2, 1)
-            zeros = zeros.reshape(P // tile_p, K // group_size, tile_p // bits // vec_c, vec_c)
+            zeros = zeros.reshape(P // tile_p, tile_p // bits, Q // tile_q, tile_q // q_group_size).transpose(0, 2, 1, 3)
+            zeros = zeros.reshape(P // tile_p, Q // tile_q, tile_p // bits // vec_p, vec_p, tile_q // q_group_size).transpose(0, 1, 2, 4, 3)
+            # (c * ls + lb) * s + z * s * lb * 2
+            # = (c * ls + lb + z * lb * 2) * s
+            # = (c * ls + (z * 2 + 1) * lb) * s
+            zeros = (zeros / scales) * 2 + 1
             scales = np.stack([scales, zeros], axis=-2)
         # input size of current TVM API
         scales = scales.reshape(P // tile_p, Q // q_group_size, -1)
@@ -138,7 +142,7 @@ bits = 2
 M = 128 * bits
 N = 1
 K = 256
-zero_point = False
+zero_point = True
 dtype = "int8"
 g = 4
 group_size = 128
